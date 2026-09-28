@@ -1,0 +1,110 @@
+name: Build Ledger Passwords for Nano Gen5
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  resolve-upstream:
+    name: Resolve official upstream revision
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve LedgerHQ/app-passwords default branch HEAD
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote https://github.com/LedgerHQ/app-passwords.git HEAD | awk 'NR == 1 { print $1 }')"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve a valid upstream commit SHA."
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Resolved upstream commit: $sha"
+
+  build:
+    name: Official Ledger build (apex_p only, no test flags)
+    needs: resolve-upstream
+    uses: LedgerHQ/ledger-app-workflows/.github/workflows/reusable_build.yml@db5fd3d8e4fe724ccc4617709c9e245976ee8280
+    with:
+      app_repository: LedgerHQ/app-passwords
+      app_branch_name: ${{ needs.resolve-upstream.outputs.upstream_sha }}
+      run_for_devices: '["apex_p"]'
+      upload_app_binaries_artifact: passwords-gen5-raw
+      artifact_retention_days: 7
+
+  validate-and-package:
+    name: Validate production build and package sideload files
+    needs:
+      - resolve-upstream
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Download official build artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: passwords-gen5-raw
+          path: raw-build
+
+      - name: Validate and prepare artifact
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ needs.resolve-upstream.outputs.upstream_sha }}
+          WORKFLOW_REF: db5fd3d8e4fe724ccc4617709c9e245976ee8280
+        run: |
+          set -euo pipefail
+          mapfile -t elfs < <(find raw-build -type f -name app.elf -print)
+          mapfile -t apdus < <(find raw-build -type f -name app.apdu -print)
+          if [[ ${#elfs[@]} -ne 1 || ${#apdus[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one app.elf and app.apdu from the apex_p build."
+            find raw-build -maxdepth 5 -type f -print
+            exit 1
+          fi
+
+          mkdir -p passwords-gen5-validated/build/apex_p/bin
+          cp "${elfs[0]}" passwords-gen5-validated/app.elf
+          cp "${apdus[0]}" passwords-gen5-validated/app.apdu
+          cp passwords-gen5-validated/app.elf passwords-gen5-validated/build/apex_p/bin/app.elf
+          cp passwords-gen5-validated/app.apdu passwords-gen5-validated/build/apex_p/bin/app.apdu
+
+          if readelf -Ws passwords-gen5-validated/app.elf | grep -Fq test_generate_password \
+             || strings -a passwords-gen5-validated/app.elf | grep -Fq test_generate_password; then
+            echo "::error::Production ELF contains the test-only test_generate_password symbol."
+            exit 1
+          fi
+          echo "Verified: test_generate_password is absent from ELF symbol table and strings."
+
+          build_date="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          cat > passwords-gen5-validated/BUILD_INFO.txt <<EOF
+          upstream repository: https://github.com/LedgerHQ/app-passwords
+          upstream commit SHA: ${UPSTREAM_SHA}
+          build date (UTC): ${build_date}
+          target device: apex_p (Ledger Nano Gen5)
+          build flags: none (official reusable_build defaults; no use_case)
+          TESTING: disabled (upstream Makefile default TESTING=0)
+          workflow version: LedgerHQ/ledger-app-workflows@${WORKFLOW_REF}
+          EOF
+
+          (
+            cd passwords-gen5-validated
+            sha256sum app.elf app.apdu build/apex_p/bin/app.elf build/apex_p/bin/app.apdu BUILD_INFO.txt > SHA256SUMS.txt
+          )
+
+      - name: Upload validated production artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: passwords-gen5-validated
+          path: passwords-gen5-validated/
+          if-no-files-found: error
+          retention-days: 7
