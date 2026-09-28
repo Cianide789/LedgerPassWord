@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
   actions: write
+  # The pinned Ledger reusable workflow declares this permission at workflow scope,
+  # even though this push/manual build does not create or update pull requests.
+  pull-requests: write
 
 jobs:
   resolve-upstream:
